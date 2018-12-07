@@ -4,11 +4,10 @@
 // @namespace   https://github.com/OpenA
 // @include     https://www.linux.org.ru/*
 // @include     http://www.linux.org.ru/*
-// @version     2.4.0
+// @version     2.5.1
 // @grant       none
 // @homepageURL https://github.com/OpenA/lorify-ng
 // @updateURL   https://rawgit.com/OpenA/lorify-ng/master/lorify-ng.user.js
-// @require     https://rawgit.com/OpenA/lorify-ng/master/tinycon.mod.js
 // @icon        https://rawgit.com/OpenA/lorify-ng/master/icons/penguin-64.png
 // @run-at      document-start
 // ==/UserScript==
@@ -19,7 +18,8 @@ const USER_SETTINGS = {
 	'Delay Open Preview': 50,
 	'Delay Close Preview': 800,
 	'Desktop Notification': true,
-	'Preloaded Pages Count': 1
+	'Preloaded Pages Count': 1,
+	'Scroll Top View': true
 }
 
 const pagesCache    = new Map;
@@ -27,7 +27,8 @@ const ResponsesMap  = new Object;
 const CommentsCache = new Object;
 const LoaderSTB     = _setup('div', { html: '<div class="page-loader"></div>' });
 const LOR           = parseLORUrl(location.pathname);
-const anonymous     = { innerText: 'anonymous' }
+const anonymous     = { innerText: 'anonymous' };
+const TOUCH_DEVICE  = 'ontouchstart' in window;
 const [,TOKEN = ''] = document.cookie.match(/CSRF_TOKEN="?([^;"]*)/);
 const Timer         = {
 	// clear timer by name
@@ -83,7 +84,6 @@ document.documentElement.append(
 			animation-duration: .3s;
 			position: absolute;
 			z-index: 300;
-			border: 1px solid grey;
 		}
 		.preview #commentForm {
 			display: none;
@@ -99,7 +99,7 @@ document.documentElement.append(
 			animation: slideUp 1s ease-out;
 		}
 		#lorcode-markup-panel {
-			margin-left: 1.1em;
+			margin-left: 5px;
 		}
 		#lorcode-markup-panel > .btn {
 			font-size: smaller!important;
@@ -130,6 +130,7 @@ document.documentElement.append(
 
 const Navigation = {
 	
+	gotoNode: null,
 	pagesCount: 1,
 	
 	bar: _setup('div', { class: 'nav', html: `
@@ -150,24 +151,8 @@ const Navigation = {
 	set page (num) {
 		var comments = pagesCache.get(LOR.page);
 		var reverse  = num > LOR.page;
-		var content;
-		
-		if (pagesCache.has(num)) {
-			swapAnimateTo(comments, (
-				content = pagesCache.get(num)
-			), reverse );
-		} else {
-			comments.parentNode.replaceChild((
-				content = LoaderSTB
-			), comments );
-			
-			pagesPreload(num).then(comms => {
-				_setup(comms.querySelector('.nav'), {
-					html: Navigation.bar.innerHTML, onclick: navBarHandle
-				});
-				swapAnimateTo(content, comms, reverse);
-			});
-		}
+		var elem     = this.gotoNode;
+		var content, hash = '';
 		
 		this.bar.querySelectorAll('.broken').forEach(lnk => lnk.classList.remove('broken'));
 		
@@ -181,9 +166,33 @@ const Navigation = {
 		}
 		this.bar.children['page_'+ (LOR.page = num)].classList.add('broken');
 		
-		_setup(content.querySelector('.nav'), { html: this.bar.innerHTML, onclick: navBarHandle });
+		if (USER_SETTINGS['Scroll Top View']) {
+			comments.querySelector('.nav').scrollIntoView({ block: 'start' });
+		}
 		
-		history.replaceState(null, document.title, LOR.path + (num ? '/page'+ num : ''));
+		const promise = new Promise(resolve => {
+			if (pagesCache.has(num)) {
+				Navigation.swapAnimateTo(comments, (
+					content = pagesCache.get(num)
+				), reverse, resolve );
+			} else {
+				comments.parentNode.replaceChild((
+					content = LoaderSTB
+				), comments );
+			
+				pagesPreload(num).then(comms => {
+					Navigation.swapAnimateTo( content, comms, reverse, resolve );
+				});
+			}
+		});
+		
+		if (elem) {
+			hash = '#'+ elem.id;
+			promise.then(() => elem.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+			this.gotoNode = null;
+		}
+		
+		history.replaceState(null, document.title, LOR.path + (num ? '/page'+ num : '') + hash);
 	},
 	
 	addToBar: function(pNumEls) {
@@ -209,6 +218,134 @@ const Navigation = {
 		this.bar.children['page_'+ LOR.page].className = 'page-number broken';
 		
 		return this.bar;
+	},
+	
+	swapAnimateTo: function(comments, content, reverse, resolve) {
+		
+		_setup(content.querySelector('.nav'), {
+			html: this.bar.innerHTML, onclick: navBarHandle
+		});
+		
+		if (USER_SETTINGS['CSS3 Animation']) {
+		
+			content.addEventListener('animationend', function(e) {
+				this.removeEventListener(e.type, arguments.callee, true);
+				this.style['animation-name'] = null;
+				this.classList.remove('terminate');
+				resolve();
+			}, true);
+			
+			content.classList.add('terminate');
+			content.style['animation-name'] = 'slideToShow'+ (reverse ? '-reverse' : '');
+		} else {
+			resolve();
+		}
+		
+		comments.parentNode.replaceChild(content, comments);
+	}
+}
+
+const Favicon = {
+	
+	original : '//www.linux.org.ru/favicon.ico',
+	index    : 0,
+	size     : 16 * ( Math.ceil(window.devicePixelRatio) || 1 ),
+	// 0: imageload promise => write resolve fn in global variable
+	imgReady : new Promise(resolve => { _ImgResolve = resolve }),
+	
+	get tabname() {
+		let title = document.title;
+		Object.defineProperty(this, 'tabname', { value: title });
+		return title;
+	},
+	
+	get canvas() {
+		let canvas = document.createElement('canvas');
+		canvas.width = canvas.height = this.size;
+		Object.defineProperty(this, 'canvas', { value: canvas });
+		return canvas;
+	},
+	
+	get image() {
+		let image = new Image;
+		// allow cross origin resource requests if the image is not a data:uri
+		if ( ! /^data:/.test(this.original)) {
+			image.crossOrigin = 'anonymous';
+		}
+		Object.defineProperty(this, 'image', {
+			value: _setup(image, {
+				// 1: imageload promise => call resolve fn
+				onload: _ImgResolve,
+				src: this.original
+			})
+		});
+		return image;
+	},
+	
+	get icon() {
+		let links = document.getElementsByTagName('link'),
+		   length = links.length;
+		
+		for (var i = 0; i < length; i++) {
+			if (links[i].rel && /\bicon\b/i.test(links[i].rel)) {
+				this.original = links[i].href;
+				Object.defineProperty(this, 'icon', { writable: true, value: links[i] });
+				return links[i];
+			}
+		}
+	},
+	
+	draw: function(label = '', color = '#48de3d') {
+		
+		const $this   = this;
+		const context = this.canvas.getContext('2d');
+		const icon    = this.icon;
+		const size    = this.size;
+		const image   = this.image;
+		
+		this.imgReady.then(e => {
+			
+			// clear canvas
+			context.clearRect(0, 0, size, size);
+			// draw the favicon
+			context.drawImage(image, 0, 0, image.width, image.height, 0, 0, size, size);
+			
+			var href = image.src;
+			
+			if (label) {
+				
+				if (typeof label === 'number' && label > 99) {
+					document.title = $this.tabname +' ('+ label +')';
+					label = '99+';
+				}
+				
+				let radius = size / 100 * 38,
+				   centerX = size - radius,
+				   centerY = radius,
+				   fontPix = radius * 1.5;
+			
+				// webkit seems to render fonts lighter than firefox
+				context.font = 'bold '+ fontPix +'px arial';
+				context.fillStyle = color;
+				context.strokeStyle = 'rgba(0,0,0,.2)';
+			
+				// bubble
+				context.beginPath();
+				context.arc(centerX, centerY, radius, 0, 2 * Math.PI, false);
+				context.fill();
+				context.stroke();
+			
+				// label
+				context.fillStyle = '#fff';
+				context.textAlign = "center";
+				context.fillText(label, centerX, fontPix);
+				href = $this.canvas.toDataURL();
+			}
+			
+			icon.parentNode.replaceChild(
+				($this.icon = _setup('link', { type: 'image/x-icon', rel: 'icon', href })), icon
+			);
+		});
 	}
 }
 
@@ -220,6 +357,7 @@ const LORCODE_BUTTONS_PANEL = _setup('div', {
 		<input class="btn btn-default" type="button" value="u">
 		<input class="btn btn-default" type="button" value="s">
 		<input class="btn btn-default" type="button" value="em">
+		<input class="btn btn-default" type="button" value="br">
 		<input class="btn btn-default" type="button" value="cut">
 		<input class="btn btn-default" type="button" value="list">
 		<input class="btn btn-default" type="button" value="strong">
@@ -228,6 +366,7 @@ const LORCODE_BUTTONS_PANEL = _setup('div', {
 		<input class="btn btn-default" type="button" value="code">
 		<input class="btn btn-default" type="button" value="inline">
 		<input class="btn btn-default" type="button" value="quote">
+		<input class="btn btn-default" type="button" value="quote-all">
 		<input class="btn btn-default" type="button" value="url">
 `});
 
@@ -246,20 +385,58 @@ _setup(document, null, {
 			
 			LOR.form.elements['csrf'].value = TOKEN;
 			
-			LOR.form.elements['msg'].parentNode.firstElementChild.appendChild(LORCODE_BUTTONS_PANEL).previousSibling.remove();
+			LOR.form.elements['msg'].parentNode.firstElementChild.appendChild(LORCODE_BUTTONS_PANEL);//.previousSibling.remove();
 			LOR.form.elements['msg'].addEventListener('click', e => e.target.classList.remove('select-break'));
 			
 			LORCODE_BUTTONS_PANEL.addEventListener('click', e => {
 				e.stopPropagation();
 				e.preventDefault();
 				if (e.target.type === 'button') {
-					const tag = e.target.value;
-					const sel = window.getSelection();
-					lorcodeMarkup.call(
-						LOR.form.elements['msg'],
-						'['+ tag +']', '[/'+ tag +']',
-						( sel.type !== 'None' && /quote|user/.test(tag) && sel.toString() )
-					);
+					let tag = e.target.value;
+					if (tag == "quote-all") {
+						let postfix = "";
+						let msgBody = LOR.form.parentNode.parentNode.parentNode.parentNode.querySelector(".msg_body");
+						if (msgBody.children.length > 1 && msgBody.children[1].getAttribute("itemprop") == "articleBody") {
+							var rootNode = msgBody.children[1];
+							postfix = "\n";
+						} else {
+							var rootNode = msgBody;
+						}
+
+						let text = "";
+						let noPrefix = false;
+						for (let i of rootNode.children) {
+							if (i.tagName == "BLOCKQUOTE") {
+								let msgText = i.innerText.replace("\n", "[br]\n");
+								text += (noPrefix ? "" : "\n") + "[quote]\n" + msgText + "[/quote]\n";
+								noPrefix = false;
+							} else if (i.tagName == "PRE") {
+								let msgText = i.innerText;
+								text += (noPrefix ? "" : "\n") + "[code]\n" + msgText + "[/code]\n";
+								noPrefix = false;
+							} else if (i.tagName == "P") {
+								let msgText = i.innerText.replace("\n", "[br]\n");
+								text += msgText + postfix + "\n";
+								noPrefix = true;
+							} else if (i.tagName == "DIV" && i.className == "code") {
+								let msgText = i.innerText;
+								text += "[code]\n" + msgText + "[/code]\n";
+								noPrefix = true;
+							}
+						}
+						lorcodeMarkup.call(
+							LOR.form.elements['msg'],
+							'[quote]', '[/quote]',
+							text
+						);
+					} else {
+						const sel = window.getSelection();
+						lorcodeMarkup.call(
+							LOR.form.elements['msg'],
+							'['+ tag +']', '[/'+ tag +']',
+							( sel.type !== 'None' && /quote|user/.test(tag) && sel.toString() )
+						);
+					}
 				}
 			});
 			window.addEventListener('keypress', winKeyHandler);
@@ -268,8 +445,6 @@ _setup(document, null, {
 		if (!LOR.topic) {
 			return;
 		}
-		
-		Tinycon.index = 0;
 		
 		const pagesElements = this.querySelectorAll('.messages > .nav > .page-number');
 		const comments      = this.getElementById('comments');
@@ -288,7 +463,7 @@ _setup(document, null, {
 		pagesCache.set(comments, LOR.page);
 		
 		addToCommentsCache(
-			comments.querySelectorAll('.msg[id^="comment-"]')
+			comments.querySelectorAll('.msg[id^="comment-"]'), null, true
 		);
 		
 		var   lastPage = Navigation.pagesCount;
@@ -300,7 +475,7 @@ _setup(document, null, {
 		);
 		
 		if (topicDel.booleanValue) {
-			Tinycon.setBubble('\u2013', '#F00');
+			Favicon.draw('\u2013', '#F00');
 		} else
 		if (!topicArc.booleanValue) {
 			if ((lastPage -= 1) > LOR.page) {
@@ -327,8 +502,8 @@ _setup(document, null, {
 			var newadded = document.querySelectorAll('.newadded');
 			newadded.forEach(nwc => nwc.classList.remove('newadded'));
 			document.querySelectorAll('#page_'+ LOR.page).forEach(pg => pg.removeAttribute('cnt-new'));
-			Tinycon.setBubble(
-				(Tinycon.index -= newadded.length)
+			Favicon.draw(
+				(Favicon.index -= newadded.length)
 			);
 		});
 	}
@@ -360,7 +535,7 @@ const RealtimeWatcher = (() => {
 			}
 			wS.onclose = e => {
 				console.warn(`Соединение c ${ wS.url } было прервано "${ e.reason }" [код: ${ e.code }]`);
-				if(!e.wasClean) {
+				if(!e.wasClean || e.code == 1008) {
 					Timer.set('WebSocket Data', RealtimeWatcher.start, 5e3);
 				}
 			}
@@ -368,7 +543,7 @@ const RealtimeWatcher = (() => {
 		}
 		static terminate(reason) {
 			wS.close(1000, reason);
-			Tinycon.setBubble('\u2013', '#F00');
+			Favicon.draw('\u2013', '#F00');
 		}
 	}
 })();
@@ -396,7 +571,7 @@ function winKeyHandler(e) {
 		}
 		
 	} else {
-
+		
 		var exit = true;
 		var tags = Object.assign({'*': ['[*]', '[/*]']}, _tags_);
 		
@@ -491,6 +666,10 @@ function lorcodeMarkup(open, close, blur) {
 			select = select.replace(/\n/gm, close);
 			close = '';
 			break;
+		case '[br]':
+			select = select.replace(/\n/gm, (close = open) +'\n' );
+			open = '';
+			break;
 		case '[*]':
 			select = select.replace(/\[\/?\*\]/g, '').replace(/\n/gm, '\n'+ open);
 			break;
@@ -518,23 +697,6 @@ function lorcodeMarkup(open, close, blur) {
 	}
 }
 
-function swapAnimateTo(comments, content, reverse) {
-	
-	if (USER_SETTINGS['CSS3 Animation']) {
-		
-		content.addEventListener('animationend', function(e) {
-			this.removeEventListener(e.type, arguments.callee, true);
-			this.style['animation-name'] = null;
-			this.classList.remove('terminate');
-		}, true);
-		
-		content.classList.add('terminate');
-		content.style['animation-name'] = 'slideToShow'+ (reverse ? '-reverse' : '');
-	}
-
-	comments.parentNode.replaceChild(content, comments);
-}
-
 function navBarHandle(e) {
 	const cL = e.target.classList;
 	if (cL[0] === 'page-number') {
@@ -555,19 +717,13 @@ function onWSData(dbCiD) {
 		({ response, responseURL }) => { // => OK
 			const { page } = parseLORUrl(responseURL);
 			
-			const comms = getCommentsContent(response),
-			      reply = comms.ownerDocument.evaluate('//article[@id="comment-'+
-			         dbCiD.join('" or @id="comment-') +'"]/*[@class="title" and contains(., "'+
-			         LOR.user +'")]', comms, null, 3, null);
-				
-			if (reply.booleanValue)
-				App.checkNow();
+			const comms = getCommentsContent(response);
 			
 			if (pagesCache.has(page)) {
 			
 				const parent = pagesCache.get(page);
 				
-				parent.querySelectorAll('.msg[id^="comment-"]').forEach(msg => {
+				for (let msg of parent.querySelectorAll('.msg[id^="comment-"]')) {
 					if (msg.id in comms.children) {
 						var cand = comms.children[msg.id],
 						    sign = cand.querySelector('.sign_more > time');
@@ -584,12 +740,12 @@ function onWSData(dbCiD) {
 							form && msg.querySelector('.msg_body').appendChild( form.parentNode ).firstElementChild.elements['msg'].focus();
 							
 						} else if (msg['edit_comment']) {
-							msg['edit_comment'].hidden = !cand.querySelector('.reply a[href^="/edit_comment"]');
+							msg['edit_comment'].parentNode.hidden = !cand.querySelector('.reply a[href^="/edit_comment"]');
 						}
 					} else {
-						_setup(msg, { id: 'deleted'+ msg.id.substring(7), class: 'msg deleted' });
+						_setup(msg, { id: 'deleted'+ msg.id.substr(7), class: 'msg deleted' });
 					}
-				});
+				}
 				
 				for (var i = 0; i < dbCiD.length; i++) {
 				
@@ -607,7 +763,7 @@ function onWSData(dbCiD) {
 				);
 				_setup(           Navigation.bar.children['page_'+ page], { 'cnt-new': cnt_new });
 				_setup( document.querySelector('#comments #page_'+ page), { 'cnt-new': cnt_new });
-				Tinycon.index += i;
+				Favicon.index += i;
 			} else {
 				
 				pagesCache.set(page, comms);
@@ -628,19 +784,20 @@ function onWSData(dbCiD) {
 					_setup(parent.querySelector('.nav'), { html: bar.innerHTML, onclick: navBarHandle });
 				}
 				addToCommentsCache( msg, { class: 'msg newadded' } );
-				Tinycon.index += msg.length;
+				Favicon.index += msg.length;
 			}
-			Tinycon.setBubble(Tinycon.index);
+			Favicon.draw(Favicon.index);
 			history.replaceState(null, document.title, location.pathname);
 		});
 }
 
-function addToCommentsCache(els, attrs) {
+function addToCommentsCache(els, attrs, jqfix) {
 	
-	for (var i = 0; i < els.length; i++) {
+	var usr_refs = 0; 
+	
+	for (let el of els) {
 		
-		let el  = els[i],
-			cid = el.id.replace('comment-', '');
+		let cid = el.id.replace('comment-', '');
 		
 		el['last_modifed'] = el.querySelector('.sign_more > time');
 		el['edit_comment'] = el.querySelector('.reply a[href^="/edit_comment"]');
@@ -656,10 +813,17 @@ function addToCommentsCache(els, attrs) {
 			let num = acid.search.match(/cid=(\d+)/)[1];
 			let url = el.ownerDocument.evaluate('//*[@class="reply"]/ul/li/a[contains(text(), "Ссылка")]/@href',el,null,2,null);
 			// Write special attributes
-			_setup(acid, { class: 'link-pref', cid: num });
+			if (jqfix) {
+				acid.parentNode.replaceChild(
+					_setup('a', { class: 'link-pref', cid: num, href: acid.getAttribute('href'), text: acid.textContent }), acid
+				);
+			} else {
+				_setup(acid, { class: 'link-pref', cid: num });
+				usr_refs += new RegExp(LOR.user).test(acid.nextSibling.textContent);
+			}
 			// Create new response-map for this comment
 			if (!(num in ResponsesMap)) {
-				ResponsesMap[num] = new Array(0);
+				ResponsesMap[num] = new Array;
 			}
 			ResponsesMap[num].push({
 				text: ( el.querySelector('a[itemprop="creator"]') || anonymous ).innerText,
@@ -687,6 +851,10 @@ function addToCommentsCache(els, attrs) {
 			
 			delete ResponsesMap[cid];
 		}
+	}
+	
+	if (usr_refs > 0) {
+		App.checkNow();
 	}
 }
 
@@ -724,7 +892,7 @@ function getCommentsContent(html) {
 }
 
 const openPreviews = document.getElementsByClassName('preview');
-var _offset_ = 1;
+var _offset_ = 1, __view = () => void 0;
 
 function removePreviews(comment) {
 	var c = openPreviews.length - _offset_;
@@ -734,8 +902,51 @@ function removePreviews(comment) {
 }
 
 function addPreviewHandler(comment, attrs) {
-	_setup(comment, attrs, {
-		mouseover: function(e) {
+	
+	comment.addEventListener('click', e => {
+		if (e.target.classList[0] === 'link-pref') {
+			var cid  = e.target.getAttribute('cid'),
+				view = document.getElementById('comment-'+ cid);
+			_offset_ = 1;
+			['Close Preview', 'Open Preview', e.target.href].forEach(Timer.clear);
+			removePreviews();
+			if (view) {
+				history.replaceState(null, document.title, location.pathname +'#comment-'+ cid);
+				view.scrollIntoView({ block: 'start', behavior: 'smooth' });
+			} else {
+				view = () => {
+					Navigation.page = pagesCache.get(
+						( Navigation.gotoNode = CommentsCache[cid] ).parentNode
+					);
+				}
+				if (cid in CommentsCache) {
+					view();
+				} else if (TOUCH_DEVICE) {
+					getDataResponse(e.target.pathname + e.target.search,
+						({ response, responseURL }) => { // => OK
+							const { page } = parseLORUrl(responseURL);
+							const comms    = getCommentsContent(response);
+							
+							pagesCache.set(page, comms);
+							pagesCache.set(comms, page);
+							
+							addToCommentsCache(
+								comms.querySelectorAll('.msg[id^="comment-"]')
+							);
+							
+							view();
+						});
+				} else {
+					new Promise(resolve => { __view = () => { __view = () => void 0; resolve() }}).then(view);
+				}
+			}
+			e.preventDefault();
+		}
+	});
+	
+	if ( ! TOUCH_DEVICE ) {
+		
+		comment.addEventListener('mouseover', e => {
 			if (e.target.classList[0] === 'link-pref') {
 				Timer.clear(e.target.href);
 				Timer.set('Open Preview', () => {
@@ -744,26 +955,17 @@ function addPreviewHandler(comment, attrs) {
 				});
 				e.preventDefault();
 			}
-		}, mouseout: function(e) {
+		});
+		
+		comment.addEventListener('mouseout', e => {
 			if (e.target.classList[0] === 'link-pref') {
 				_offset_ = 1;
 				Timer.clear('Open Preview');
 			}
-		}, click: function(e) {
-			if (e.target.classList[0] === 'link-pref') {
-				var cid  = e.target.getAttribute('cid'),
-					view = document.getElementById('comment-'+ cid);
-				if (view) {
-					view.scrollIntoView({ block: 'start', behavior: 'smooth' });
-				} else {
-					view = CommentsCache[cid];
-					Navigation.page = pagesCache.get(view.parentNode);
-					setTimeout(() => view.scrollIntoView({ block: 'start', behavior: 'smooth' }), 300);
-				}
-				e.preventDefault();
-			}
-		}
-	});
+		});
+	}
+	
+	_setup(comment, attrs);
 }
 
 function showPreview(e) {
@@ -806,6 +1008,7 @@ function showPreview(e) {
 						e
 					);
 				}
+				__view();
 			}, ({ status, statusText }) => { // => Error
 				commentEl.textContent = status +' '+ statusText;
 				commentEl.classList.add('msg-error');
@@ -856,10 +1059,10 @@ function showCommentInternal(commentElement, commentID, e) {
 		// Avoid duplicated IDs when the original comment was found on the same page
 			id: 'preview-'+ commentID, 
 			class: 'msg preview',
-			style: 'animation-name: toShow; '+
+			style: 'animation-name: toShow; border: 1px solid grey; '+
 				// There are no limitations for the 'z-index' in the CSS standard,
 				// so it depends on the browser. Let's just set it to 300
-				'max-width:'+ parentBlock.offsetWidth +
+				'max-width: '+ parentBlock.offsetWidth +
 				'px; left: '+
 				( left < visibleWidth
 				       ? offsetX
@@ -1027,46 +1230,51 @@ function toggleForm(e) {
 
 const App = (() => {
 	
-	var main_events_count = '0';
+	var main_events_count;
 	
 	if (typeof chrome !== 'undefined' && chrome.runtime.id) {
 		
 		const port = chrome.runtime.connect(chrome.runtime.id, { name: location.href });
 		const sync = new Promise((resolve, reject) => {
-			chrome.storage.sync.get(USER_SETTINGS, items => {
-				for (let name in items) {
-					USER_SETTINGS[name] = items[name];
+			
+			const onResponseHandler = items => {
+				if (typeof items === 'object') {
+					for (let name in items) {
+						USER_SETTINGS[name] = items[name];
+					}
+					port.onMessage.removeListener(onResponseHandler);
+					resolve();
 				}
-				resolve();
+			};
+			
+			port.onMessage.addListener(onResponseHandler);
+			chrome.runtime.sendMessage({ action : 'l0rNG-settings' });
+			chrome.storage.onChanged.addListener(items => {
+				for (let name in items) {
+					USER_SETTINGS[name] = items[name].newValue;
+				}
 			});
 		});
-		chrome.storage.onChanged.addListener(items => {
-			for (let name in items) {
-				USER_SETTINGS[name] = items[name].newValue;
-			}
-		});
+		
 		return {
-			checkNow: () => chrome.runtime.sendMessage({ action: 'l0rNG-checkNow' }),
-			init: () => {
-				const onResponseHandler = (
-				      main_events_count = document.getElementById('main_events_count')
-				  ) ? text => {
-				      main_events_count.textContent = text;
-				  } : (  ) => void 0;
-				// We can't show notification from the content script directly,
-				// so let's send a corresponding message to the background script
-				port.onMessage.addListener(onResponseHandler);
-				chrome.runtime.sendMessage({
-					action : 'l0rNG-init',
-					notes  : main_events_count !== null ? main_events_count.innerText.replace(/\((\d+)\)/, '$1') : ''
-				});
+			checkNow : () => chrome.runtime.sendMessage({ action: 'l0rNG-checkNow' }),
+			init     : () => {
+				if ( (main_events_count = document.getElementById('main_events_count')) ) {
+					// We can't show notification from the content script directly,
+					// so let's send a corresponding message to the background script
+					port.onMessage.addListener(text => { main_events_count.textContent = text });
+					chrome.runtime.sendMessage({
+						action : 'l0rNG-init',
+						notes  : main_events_count.innerText.replace(/\((\d+)\)/, '$1')
+					});
+				}
 				return sync;
 			}
 		}
 	} else {
 		
 		var notes      = localStorage.getItem('l0rNG-notes') || '';
-		var delay      = 12e3;
+		var delay      = 40e3 + Math.floor(Math.random() * 1e3);
 		var sendNotify = count => new Notification('loryfy-ng', {
 				icon: '//github.com/OpenA/lorify-ng/blob/master/icons/penguin-64.png?raw=true',
 				body: 'Уведомлений: '+ count
@@ -1076,16 +1284,15 @@ const App = (() => {
 		const startWatch = getDataResponse.bind(null, '/notifications-count',
 			({ response }) => {
 				var text = '';
-				if (response != '0') {
+				if (response != 0) {
 					text = '('+ response +')';
-					if (USER_SETTINGS['Desktop Notification'] && notes != response) {
-						localStorage.setItem('l0rNG-notes', response);
-						sendNotify( (notes = response) );
-						delay = 0;
+					if (notes != response) {
+						localStorage.setItem('l0rNG-notes', (notes = response));
+						USER_SETTINGS['Desktop Notification'] && sendNotify(response);
 					}
 				}
 				main_events_count.textContent = lorynotify.textContent = text;
-				Timer.set('Check Notifications', startWatch, delay < 6e4 ? (delay += 12e3) : delay);
+				Timer.set('Check Notifications', startWatch, delay);
 			});
 		
 		const setValues = items => {
@@ -1136,6 +1343,11 @@ const App = (() => {
 			<div class="tab-row">
 				<span class="tab-cell">Оповещения на рабочий стол:</span>
 				<span class="tab-cell"><input type="checkbox" id="Desktop Notification">
+				</span>
+			</div>
+			<div class="tab-row">
+				<span class="tab-cell">Возвращать наверх:</span>
+				<span class="tab-cell"><input type="checkbox" id="Scroll Top View">
 				</span>
 			</div>
 			<div class="tab-row">
@@ -1238,9 +1450,7 @@ const App = (() => {
 						!!(notes = $1) && sendNotify( $1 );
 						localStorage.setItem('l0rNG-notes', $1);
 					}
-					!(this.checkNow = function(ms) {
-						Timer.set('Check Notifications', startWatch, ms);
-					})(delay);
+					Timer.set('Check Notifications', (this.checkNow = startWatch), delay);
 				}
 				document.body.append(lorynotify, lorytoggle);
 				return { then: c => c() }
